@@ -53,10 +53,13 @@ async function toRecords(
         createSignedUrls: (
           paths: string[],
           ttl: number,
-        ) => Promise<{ data: { path: string | null; signedUrl: string }[] | null }>;
+        ) => Promise<{
+          data: { path?: string | null; signedUrl?: string | null }[] | null;
+        }>;
       };
     };
   },
+
   rows: {
     id: string;
     original_file_name: string;
