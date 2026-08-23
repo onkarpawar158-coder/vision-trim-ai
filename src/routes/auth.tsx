@@ -4,14 +4,18 @@ import { z } from "zod";
 import { Loader2, Mail, Lock, User as UserIcon, Eye, EyeOff } from "lucide-react";
 import { toast } from "sonner";
 import { supabase } from "@/integrations/supabase/client";
-import { lovable } from "@/integrations/lovable/index";
 import { Logo } from "@/components/brand/Logo";
 import { GradientButton } from "@/components/brand/GradientButton";
 import { useAuth } from "@/hooks/useAuth";
 
-const searchSchema = z.object({
-  mode: z.enum(["login", "register"]).catch("login"),
-});
+const searchSchema = z
+  .object({
+    mode: z.enum(["login", "register"]).catch("login"),
+    code: z.string().optional(),
+    error: z.string().optional(),
+    error_description: z.string().optional(),
+  })
+  .catch({ mode: "login" as const });
 
 export const Route = createFileRoute("/auth")({
   validateSearch: searchSchema,
@@ -41,7 +45,8 @@ const credentials = z.object({
 });
 
 function AuthPage() {
-  const { mode } = Route.useSearch();
+  const search = Route.useSearch();
+  const { mode } = search;
   const navigate = useNavigate();
   const { session, loading } = useAuth();
 
@@ -52,12 +57,53 @@ function AuthPage() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [sentEmail, setSentEmail] = useState(false);
+  const [exchangingCode, setExchangingCode] = useState(false);
 
   const isRegister = mode === "register";
 
   useEffect(() => {
+    if (!search.error) return;
+    const message = search.error_description
+      ? decodeURIComponent(search.error_description)
+      : `OAuth error: ${search.error}`;
+    setError((prev) => prev ?? message);
+  }, [search.error, search.error_description]);
+
+  useEffect(() => {
     if (!loading && session) navigate({ to: "/dashboard", replace: true });
   }, [loading, session, navigate]);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      if (!search.code || exchangingCode) return;
+      setExchangingCode(true);
+      try {
+        const { error: exchangeError } = await supabase.auth.exchangeCodeForSession(search.code);
+        if (exchangeError && !cancelled) {
+          setError(
+            exchangeError.message ||
+              (search.error_description
+                ? decodeURIComponent(search.error_description)
+                : search.error
+                  ? `OAuth error: ${search.error}`
+                  : "Sign-in failed. Please try again."),
+          );
+        }
+      } catch (e) {
+        if (!cancelled) {
+          setError(
+            e instanceof Error ? e.message : "Sign-in failed. Please try again.",
+          );
+        }
+      } finally {
+        if (!cancelled) setExchangingCode(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [search.code, search.error, search.error_description, exchangingCode]);
 
   async function handleSubmit(event: React.FormEvent) {
     event.preventDefault();
@@ -80,7 +126,7 @@ function AuthPage() {
           email: parsed.data.email,
           password: parsed.data.password,
           options: {
-            emailRedirectTo: `${window.location.origin}/dashboard`,
+            emailRedirectTo: `${window.location.origin}/auth`,
             data: { name: name.trim() },
           },
         });
@@ -97,22 +143,45 @@ function AuthPage() {
           toast.success("Check your email to confirm your account.");
           return;
         }
+        const { data: recheck } = await supabase.auth.getSession();
+        if (!recheck.session) {
+          setSentEmail(true);
+          toast.success("Check your email to confirm your account.");
+          return;
+        }
         toast.success("Welcome to SnapCut AI!");
-        navigate({ to: "/dashboard" });
+        navigate({ to: "/dashboard", replace: true });
       } else {
         const { error: signInError } = await supabase.auth.signInWithPassword({
           email: parsed.data.email,
           password: parsed.data.password,
         });
         if (signInError) {
-          setError("Incorrect email or password. Please try again.");
+          if (signInError.code === "email_not_confirmed") {
+            setError(
+              "Please confirm your email address before logging in. Check your inbox for the confirmation link.",
+            );
+          } else {
+            setError(signInError.message || "Sign-in failed. Please try again.");
+          }
           return;
         }
+        const { data: recheck } = await supabase.auth.getSession();
+        if (!recheck.session) {
+          await new Promise((r) => setTimeout(r, 300));
+          const { data: recheck2 } = await supabase.auth.getSession();
+          if (!recheck2.session) {
+            setError("Session was not created. Please try again.");
+            return;
+          }
+        }
         toast.success("Welcome back!");
-        navigate({ to: "/dashboard" });
+        navigate({ to: "/dashboard", replace: true });
       }
-    } catch {
-      setError("Something went wrong. Please try again.");
+    } catch (e) {
+      const message =
+        e instanceof Error && e.message ? e.message : "Something went wrong. Please try again.";
+      setError(message);
     } finally {
       setBusy(false);
     }
@@ -121,16 +190,25 @@ function AuthPage() {
   async function handleGoogle() {
     setError(null);
     setBusy(true);
-    const result = await lovable.auth.signInWithOAuth("google", {
-      redirect_uri: window.location.origin,
-    });
-    if (result.error) {
-      setError("Google sign-in failed. Please try again.");
+    try {
+      const { error } = await supabase.auth.signInWithOAuth({
+        provider: "google",
+        options: {
+          redirectTo: `${window.location.origin}/auth`,
+        },
+      });
+      if (error) {
+        setError(
+          error.message || "Google sign-in failed. Please try again.",
+        );
+        setBusy(false);
+      }
+    } catch (e) {
+      setError(
+        e instanceof Error ? e.message : "Google sign-in failed. Please try again.",
+      );
       setBusy(false);
-      return;
     }
-    if (result.redirected) return;
-    navigate({ to: "/dashboard" });
   }
 
   return (
@@ -142,7 +220,14 @@ function AuthPage() {
         </div>
 
         <div className="glass-card rounded-2xl p-7 sm:p-8">
-          {sentEmail ? (
+          {exchangingCode ? (
+            <div className="flex flex-col items-center gap-3 text-center">
+              <Loader2 className="size-6 animate-spin text-brand-cyan" />
+              <p className="text-sm text-muted-foreground">
+                Completing sign-in…
+              </p>
+            </div>
+          ) : sentEmail ? (
             <div className="text-center">
               <h1 className="text-xl font-semibold">Confirm your email</h1>
               <p className="mt-3 text-sm text-muted-foreground">
