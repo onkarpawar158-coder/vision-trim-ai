@@ -1,9 +1,10 @@
 import { createFileRoute, useNavigate, Link } from "@tanstack/react-router";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { z } from "zod";
-import { Loader2, Mail, Lock, User as UserIcon, Eye, EyeOff } from "lucide-react";
+import { Loader2, Mail, Lock, User as UserIcon, Eye, EyeOff, Send, AlertCircle } from "lucide-react";
 import { toast } from "sonner";
 import { supabase } from "@/integrations/supabase/client";
+import { lovable } from "@/integrations/lovable";
 import { Logo } from "@/components/brand/Logo";
 import { GradientButton } from "@/components/brand/GradientButton";
 import { useAuth } from "@/hooks/useAuth";
@@ -14,6 +15,7 @@ const searchSchema = z
     code: z.string().optional(),
     error: z.string().optional(),
     error_description: z.string().optional(),
+    error_code: z.string().optional(),
   })
   .catch({ mode: "login" as const });
 
@@ -56,58 +58,115 @@ function AuthPage() {
   const [showPassword, setShowPassword] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [isEmailUnconfirmed, setIsEmailUnconfirmed] = useState(false);
+  const [resendingEmail, setResendingEmail] = useState(false);
   const [sentEmail, setSentEmail] = useState(false);
   const [exchangingCode, setExchangingCode] = useState(false);
+  const exchangingCodeRef = useRef(false);
 
   const isRegister = mode === "register";
 
+  // Check URL search params for errors
   useEffect(() => {
-    if (!search.error) return;
+    if (!search.error && !search.error_description) return;
     const message = search.error_description
-      ? decodeURIComponent(search.error_description)
+      ? decodeURIComponent(search.error_description.replace(/\+/g, " "))
       : `OAuth error: ${search.error}`;
     setError((prev) => prev ?? message);
   }, [search.error, search.error_description]);
 
+  // Check URL hash fragment for errors or tokens
   useEffect(() => {
-    if (!loading && session) navigate({ to: "/dashboard", replace: true });
+    if (typeof window === "undefined") return;
+    const hash = window.location.hash;
+    if (!hash) return;
+    try {
+      const params = new URLSearchParams(hash.replace(/^#/, ""));
+      const hashError = params.get("error");
+      const hashDesc = params.get("error_description");
+      if (hashError || hashDesc) {
+        setError(
+          hashDesc
+            ? decodeURIComponent(hashDesc.replace(/\+/g, " "))
+            : `Authentication error: ${hashError}`,
+        );
+      }
+    } catch {
+      // Ignore hash parse errors
+    }
+  }, []);
+
+  // Redirect to dashboard if already authenticated
+  useEffect(() => {
+    if (!loading && session) {
+      navigate({ to: "/dashboard", replace: true });
+    }
   }, [loading, session, navigate]);
 
+  // Handle PKCE code exchange from email confirmation or OAuth callback
   useEffect(() => {
-    let cancelled = false;
+    if (!search.code || exchangingCodeRef.current) return;
+    exchangingCodeRef.current = true;
+    setExchangingCode(true);
+
     (async () => {
-      if (!search.code || exchangingCode) return;
-      setExchangingCode(true);
       try {
-        const { error: exchangeError } = await supabase.auth.exchangeCodeForSession(search.code);
-        if (exchangeError && !cancelled) {
-          setError(
-            exchangeError.message ||
-              (search.error_description
-                ? decodeURIComponent(search.error_description)
-                : search.error
-                  ? `OAuth error: ${search.error}`
-                  : "Sign-in failed. Please try again."),
-          );
+        const { data, error: exchangeError } = await supabase.auth.exchangeCodeForSession(search.code);
+        if (exchangeError) {
+          const desc = search.error_description
+            ? decodeURIComponent(search.error_description.replace(/\+/g, " "))
+            : search.error
+              ? `OAuth error: ${search.error}`
+              : null;
+          setError(exchangeError.message || desc || "Sign-in verification failed. Please try logging in.");
+        } else if (data.session) {
+          toast.success("Successfully signed in!");
+          navigate({ to: "/dashboard", replace: true });
         }
       } catch (e) {
-        if (!cancelled) {
-          setError(
-            e instanceof Error ? e.message : "Sign-in failed. Please try again.",
-          );
-        }
+        setError(e instanceof Error ? e.message : "Sign-in failed. Please try again.");
       } finally {
-        if (!cancelled) setExchangingCode(false);
+        setExchangingCode(false);
       }
     })();
-    return () => {
-      cancelled = true;
-    };
-  }, [search.code, search.error, search.error_description, exchangingCode]);
+  }, [search.code, search.error, search.error_description, navigate]);
+
+  async function handleResendConfirmation() {
+    const trimmed = email.trim();
+    if (!trimmed) {
+      setError("Please enter your email address above first.");
+      return;
+    }
+    setResendingEmail(true);
+    try {
+      const { error: resendError } = await supabase.auth.resend({
+        type: "signup",
+        email: trimmed,
+        options: {
+          emailRedirectTo: `${window.location.origin}/auth`,
+        },
+      });
+      if (resendError) {
+        const msg = resendError.message?.toLowerCase() || "";
+        if (msg.includes("rate limit") || resendError.status === 429) {
+          toast.error("Email rate limit exceeded. Please wait a few minutes before requesting another email.");
+        } else {
+          toast.error(resendError.message || "Could not resend confirmation email.");
+        }
+      } else {
+        toast.success(`Confirmation email resent to ${trimmed}. Please check your inbox!`);
+      }
+    } catch {
+      toast.error("Failed to resend confirmation email.");
+    } finally {
+      setResendingEmail(false);
+    }
+  }
 
   async function handleSubmit(event: React.FormEvent) {
     event.preventDefault();
     setError(null);
+    setIsEmailUnconfirmed(false);
 
     const parsed = credentials.safeParse({ email, password });
     if (!parsed.success) {
@@ -115,7 +174,7 @@ function AuthPage() {
       return;
     }
     if (isRegister && name.trim().length < 2) {
-      setError("Please enter your name.");
+      setError("Please enter your name (at least 2 characters).");
       return;
     }
 
@@ -130,51 +189,68 @@ function AuthPage() {
             data: { name: name.trim() },
           },
         });
+
         if (signUpError) {
-          setError(
-            signUpError.message.toLowerCase().includes("already")
-              ? "An account with this email already exists. Try logging in."
-              : signUpError.message,
-          );
+          const msg = signUpError.message?.toLowerCase() || "";
+          if (msg.includes("rate limit") || signUpError.status === 429) {
+            setError(
+              "Email rate limit exceeded: Supabase limits verification emails per hour. If you have already registered with this email, please log in below.",
+            );
+          } else if (msg.includes("already") || msg.includes("registered") || signUpError.status === 422) {
+            setError("An account with this email already exists. Try logging in with your password.");
+          } else {
+            setError(signUpError.message || "Registration failed. Please try again.");
+          }
           return;
         }
-        if (!data.session) {
-          setSentEmail(true);
-          toast.success("Check your email to confirm your account.");
+
+        // If session is already created (auto-confirm enabled), navigate to dashboard
+        if (data.session) {
+          toast.success("Welcome to SnapCut AI!");
+          navigate({ to: "/dashboard", replace: true });
           return;
         }
-        const { data: recheck } = await supabase.auth.getSession();
-        if (!recheck.session) {
-          setSentEmail(true);
-          toast.success("Check your email to confirm your account.");
-          return;
-        }
-        toast.success("Welcome to SnapCut AI!");
-        navigate({ to: "/dashboard", replace: true });
+
+        // Email confirmation is required
+        setSentEmail(true);
+        toast.success("Check your email to confirm your account.");
       } else {
-        const { error: signInError } = await supabase.auth.signInWithPassword({
+        const { data, error: signInError } = await supabase.auth.signInWithPassword({
           email: parsed.data.email,
           password: parsed.data.password,
         });
+
         if (signInError) {
-          if (signInError.code === "email_not_confirmed") {
+          const msg = signInError.message?.toLowerCase() || "";
+          if (signInError.code === "email_not_confirmed" || msg.includes("email not confirmed")) {
+            setIsEmailUnconfirmed(true);
             setError(
               "Please confirm your email address before logging in. Check your inbox for the confirmation link.",
             );
+          } else if (msg.includes("rate limit") || signInError.status === 429) {
+            setError("Too many login attempts. Please wait a few minutes and try again.");
+          } else if (msg.includes("invalid login credentials") || msg.includes("invalid credentials")) {
+            setError("Invalid email or password. Please check your credentials or create a free account.");
           } else {
             setError(signInError.message || "Sign-in failed. Please try again.");
           }
           return;
         }
-        const { data: recheck } = await supabase.auth.getSession();
-        if (!recheck.session) {
-          await new Promise((r) => setTimeout(r, 300));
-          const { data: recheck2 } = await supabase.auth.getSession();
-          if (!recheck2.session) {
-            setError("Session was not created. Please try again.");
-            return;
-          }
+
+        if (data.session) {
+          toast.success("Welcome back!");
+          navigate({ to: "/dashboard", replace: true });
+          return;
         }
+
+        // In case session update is asynchronously dispatched
+        const { data: recheck } = await supabase.auth.getSession();
+        if (recheck.session) {
+          toast.success("Welcome back!");
+          navigate({ to: "/dashboard", replace: true });
+          return;
+        }
+
         toast.success("Welcome back!");
         navigate({ to: "/dashboard", replace: true });
       }
@@ -189,24 +265,99 @@ function AuthPage() {
 
   async function handleGoogle() {
     setError(null);
+    setIsEmailUnconfirmed(false);
     setBusy(true);
+
     try {
-      const { error } = await supabase.auth.signInWithOAuth({
+      let isInIframe = false;
+      try {
+        isInIframe = typeof window !== "undefined" && window.self !== window.top;
+      } catch {
+        isInIframe = true;
+      }
+
+      if (isInIframe) {
+        // Inside Lovable preview iframe: use Lovable Cloud Auth broker
+        const result = await lovable.auth.signInWithOAuth("google", {
+          redirect_uri: `${window.location.origin}/auth`,
+        });
+
+        if (result.redirected) {
+          return;
+        }
+
+        if (result.error) {
+          const errMsg = result.error.message || "";
+          if (
+            errMsg.toLowerCase().includes("not enabled") ||
+            errMsg.toLowerCase().includes("unsupported provider") ||
+            errMsg.toLowerCase().includes("validation_failed")
+          ) {
+            setError(
+              "Google sign-in is not enabled for this project. Please sign in with email and password, or enable Google provider in your Supabase Auth settings.",
+            );
+          } else {
+            setError(errMsg || "Google sign-in failed. Please try again.");
+          }
+          setBusy(false);
+          return;
+        }
+
+        if (result.tokens) {
+          toast.success("Welcome back!");
+          navigate({ to: "/dashboard", replace: true });
+          return;
+        }
+      }
+
+      // Outside iframe (standalone browser): use direct Supabase OAuth with skipBrowserRedirect
+      // This prevents the browser from navigating to 404 or raw 400 JSON pages
+      const { data, error: oauthError } = await supabase.auth.signInWithOAuth({
         provider: "google",
         options: {
           redirectTo: `${window.location.origin}/auth`,
+          skipBrowserRedirect: true,
         },
       });
-      if (error) {
+
+      if (oauthError) {
+        const msg = oauthError.message || "";
+        if (
+          msg.toLowerCase().includes("not enabled") ||
+          msg.toLowerCase().includes("unsupported provider") ||
+          msg.toLowerCase().includes("validation_failed")
+        ) {
+          setError(
+            "Google sign-in is not enabled for this project. Please sign in with email and password, or enable Google provider in your Supabase Auth settings.",
+          );
+        } else {
+          setError(msg || "Google sign-in failed. Please try again.");
+        }
+        setBusy(false);
+        return;
+      }
+
+      if (data?.url) {
+        window.location.href = data.url;
+      } else {
         setError(
-          error.message || "Google sign-in failed. Please try again.",
+          "Google sign-in is not configured on this Supabase project. Please sign in with email and password.",
         );
         setBusy(false);
       }
     } catch (e) {
-      setError(
-        e instanceof Error ? e.message : "Google sign-in failed. Please try again.",
-      );
+      const errMsg = e instanceof Error ? e.message : String(e);
+      if (
+        errMsg.toLowerCase().includes("not enabled") ||
+        errMsg.toLowerCase().includes("unsupported provider") ||
+        errMsg.toLowerCase().includes("validation_failed")
+      ) {
+        setError(
+          "Google sign-in is not enabled for this project. Please sign in with email and password, or enable Google provider in your Supabase Auth settings.",
+        );
+      } else {
+        setError(errMsg || "Google sign-in failed. Please try again.");
+      }
       setBusy(false);
     }
   }
@@ -221,27 +372,48 @@ function AuthPage() {
 
         <div className="glass-card rounded-2xl p-7 sm:p-8">
           {exchangingCode ? (
-            <div className="flex flex-col items-center gap-3 text-center">
-              <Loader2 className="size-6 animate-spin text-brand-cyan" />
-              <p className="text-sm text-muted-foreground">
+            <div className="flex flex-col items-center gap-3 py-6 text-center">
+              <Loader2 className="size-8 animate-spin text-brand-cyan" />
+              <p className="text-sm font-medium text-foreground">
                 Completing sign-in…
+              </p>
+              <p className="text-xs text-muted-foreground">
+                Verifying your credentials, please wait.
               </p>
             </div>
           ) : sentEmail ? (
             <div className="text-center">
+              <div className="mx-auto mb-4 grid size-12 place-items-center rounded-2xl bg-brand-cyan/10 text-brand-cyan">
+                <Mail className="size-6" />
+              </div>
               <h1 className="text-xl font-semibold">Confirm your email</h1>
               <p className="mt-3 text-sm text-muted-foreground">
-                We sent a confirmation link to <span className="text-foreground">{email}</span>.
-                Click it to activate your account, then come back and log in.
+                We sent a confirmation link to <span className="font-medium text-foreground">{email}</span>.
+                Click the link in your email to activate your account.
               </p>
-              <Link
-                to="/auth"
-                search={{ mode: "login" }}
-                onClick={() => setSentEmail(false)}
-                className="mt-6 inline-block text-sm text-brand-cyan hover:underline"
-              >
-                Back to login
-              </Link>
+              <div className="mt-6 flex flex-col gap-3">
+                <button
+                  type="button"
+                  onClick={handleResendConfirmation}
+                  disabled={resendingEmail}
+                  className="inline-flex items-center justify-center gap-2 text-sm font-medium text-brand-cyan hover:underline disabled:opacity-50"
+                >
+                  {resendingEmail ? (
+                    <Loader2 className="size-3.5 animate-spin" />
+                  ) : (
+                    <Send className="size-3.5" />
+                  )}
+                  Resend confirmation email
+                </button>
+                <Link
+                  to="/auth"
+                  search={{ mode: "login" }}
+                  onClick={() => setSentEmail(false)}
+                  className="text-sm text-muted-foreground hover:text-foreground"
+                >
+                  Back to login
+                </Link>
+              </div>
             </div>
           ) : (
             <>
@@ -324,9 +496,27 @@ function AuthPage() {
                 </div>
 
                 {error && (
-                  <p role="alert" className="rounded-lg bg-destructive/10 px-3 py-2 text-sm text-destructive">
-                    {error}
-                  </p>
+                  <div role="alert" className="space-y-2 rounded-lg bg-destructive/10 p-3 text-sm text-destructive">
+                    <div className="flex items-start gap-2">
+                      <AlertCircle className="mt-0.5 size-4 shrink-0" />
+                      <p className="flex-1 leading-relaxed">{error}</p>
+                    </div>
+                    {isEmailUnconfirmed && (
+                      <button
+                        type="button"
+                        onClick={handleResendConfirmation}
+                        disabled={resendingEmail}
+                        className="inline-flex items-center gap-1.5 pl-6 text-xs font-semibold underline hover:opacity-80 disabled:opacity-50"
+                      >
+                        {resendingEmail ? (
+                          <Loader2 className="size-3 animate-spin" />
+                        ) : (
+                          <Send className="size-3" />
+                        )}
+                        Resend confirmation email
+                      </button>
+                    )}
+                  </div>
                 )}
 
                 <GradientButton type="submit" size="lg" className="w-full" disabled={busy}>
@@ -340,6 +530,10 @@ function AuthPage() {
                 <Link
                   to="/auth"
                   search={{ mode: isRegister ? "login" : "register" }}
+                  onClick={() => {
+                    setError(null);
+                    setIsEmailUnconfirmed(false);
+                  }}
                   className="font-medium text-brand-cyan hover:underline"
                 >
                   {isRegister ? "Log in" : "Create one free"}
