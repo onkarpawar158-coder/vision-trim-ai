@@ -105,13 +105,14 @@ function AuthPage() {
 
   // Handle PKCE code exchange from email confirmation or OAuth callback
   useEffect(() => {
-    if (!search.code || exchangingCodeRef.current) return;
+    const code = search.code;
+    if (!code || exchangingCodeRef.current) return;
     exchangingCodeRef.current = true;
     setExchangingCode(true);
 
     (async () => {
       try {
-        const { data, error: exchangeError } = await supabase.auth.exchangeCodeForSession(search.code);
+        const { data, error: exchangeError } = await supabase.auth.exchangeCodeForSession(code);
         if (exchangeError) {
           const desc = search.error_description
             ? decodeURIComponent(search.error_description.replace(/\+/g, " "))

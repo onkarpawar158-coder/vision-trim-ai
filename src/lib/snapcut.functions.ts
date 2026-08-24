@@ -103,62 +103,110 @@ export const getOverview = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
   .handler(async ({ context }): Promise<OverviewData> => {
     const { supabase, userId } = context;
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-
-    const [profileRes, usageRes, totalRes, recentRes] = await Promise.all([
-      supabase.from("profiles").select("name, email").eq("id", userId).maybeSingle(),
-      supabase
-        .from("usage")
-        .select("processing_count")
-        .eq("user_id", userId)
-        .eq("date", todayKey())
-        .maybeSingle(),
-      supabase
-        .from("image_processing")
-        .select("id", { count: "exact", head: true })
-        .eq("user_id", userId)
-        .eq("status", "success"),
-      supabase
-        .from("image_processing")
-        .select(
-          "id, original_file_name, original_format, status, processing_time_ms, created_at, original_url, processed_url",
-        )
-        .eq("user_id", userId)
-        .eq("status", "success")
-        .order("created_at", { ascending: false })
-        .limit(6),
-    ]);
-
     const limit = dailyLimit();
-    const used = usageRes.data?.processing_count ?? 0;
 
-    return {
-      name: profileRes.data?.name ?? "",
-      email: profileRes.data?.email ?? "",
-      used,
-      remaining: Math.max(0, limit - used),
-      limit,
-      totalProcessed: totalRes.count ?? 0,
-      recent: await toRecords(supabaseAdmin, recentRes.data ?? []),
-    };
+    try {
+      let supabaseAdminClient: any = null;
+      try {
+        const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+        supabaseAdminClient = supabaseAdmin;
+      } catch {
+        // Service role not configured
+      }
+
+      const [profileRes, usageRes, totalRes, recentRes] = await Promise.allSettled([
+        supabase.from("profiles").select("name, email").eq("id", userId).maybeSingle(),
+        supabase
+          .from("usage")
+          .select("processing_count")
+          .eq("user_id", userId)
+          .eq("date", todayKey())
+          .maybeSingle(),
+        supabase
+          .from("image_processing")
+          .select("id", { count: "exact", head: true })
+          .eq("user_id", userId)
+          .eq("status", "success"),
+        supabase
+          .from("image_processing")
+          .select(
+            "id, original_file_name, original_format, status, processing_time_ms, created_at, original_url, processed_url",
+          )
+          .eq("user_id", userId)
+          .eq("status", "success")
+          .order("created_at", { ascending: false })
+          .limit(6),
+      ]);
+
+      const profileData = profileRes.status === "fulfilled" ? profileRes.value.data : null;
+      const usageData = usageRes.status === "fulfilled" ? usageRes.value.data : null;
+      const totalCount = totalRes.status === "fulfilled" ? (totalRes.value.count ?? 0) : 0;
+      const recentData = recentRes.status === "fulfilled" ? (recentRes.value.data ?? []) : [];
+
+      const used = usageData?.processing_count ?? 0;
+      let recentRecords: ImageRecord[] = [];
+
+      if (supabaseAdminClient && recentData.length > 0) {
+        try {
+          recentRecords = await toRecords(supabaseAdminClient, recentData);
+        } catch {
+          recentRecords = [];
+        }
+      }
+
+      const userMeta = context.claims?.["user_metadata"] as Record<string, unknown> | undefined;
+      const fallbackName = typeof userMeta?.["name"] === "string" ? userMeta["name"] : "";
+      const fallbackEmail = typeof context.claims?.["email"] === "string" ? context.claims["email"] : "";
+
+      return {
+        name: profileData?.name || fallbackName,
+        email: profileData?.email || fallbackEmail,
+        used,
+        remaining: Math.max(0, limit - used),
+        limit,
+        totalProcessed: totalCount,
+        recent: recentRecords,
+      };
+    } catch (err) {
+      console.warn("[SnapCut] getOverview fallback:", err);
+      const userMeta = context.claims?.["user_metadata"] as Record<string, unknown> | undefined;
+      const fallbackName = typeof userMeta?.["name"] === "string" ? userMeta["name"] : "";
+      const fallbackEmail = typeof context.claims?.["email"] === "string" ? context.claims["email"] : "";
+
+      return {
+        name: fallbackName,
+        email: fallbackEmail,
+        used: 0,
+        remaining: limit,
+        limit,
+        totalProcessed: 0,
+        recent: [],
+      };
+    }
   });
 
 export const getHistory = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
   .handler(async ({ context }): Promise<ImageRecord[]> => {
     const { supabase, userId } = context;
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
 
-    const { data } = await supabase
-      .from("image_processing")
-      .select(
-        "id, original_file_name, original_format, status, processing_time_ms, created_at, original_url, processed_url",
-      )
-      .eq("user_id", userId)
-      .order("created_at", { ascending: false })
-      .limit(100);
+    try {
+      const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+      const { data } = await supabase
+        .from("image_processing")
+        .select(
+          "id, original_file_name, original_format, status, processing_time_ms, created_at, original_url, processed_url",
+        )
+        .eq("user_id", userId)
+        .order("created_at", { ascending: false })
+        .limit(100);
 
-    return toRecords(supabaseAdmin, data ?? []);
+      if (!data) return [];
+      return await toRecords(supabaseAdmin, data);
+    } catch (err) {
+      console.warn("[SnapCut] getHistory fallback:", err);
+      return [];
+    }
   });
 
 export const updateProfileName = createServerFn({ method: "POST" })

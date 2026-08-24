@@ -1,8 +1,9 @@
 import { useRef, useState } from "react";
 import { useServerFn } from "@tanstack/react-start";
 import { useQueryClient } from "@tanstack/react-query";
-import { Download, ImagePlus, Loader2, RotateCcw, UploadCloud } from "lucide-react";
+import { Download, ImagePlus, Loader2, RotateCcw, Sparkles, UploadCloud } from "lucide-react";
 import { toast } from "sonner";
+import { removeBackground as imglyRemoveBackground } from "@imgly/background-removal";
 import { GradientButton } from "@/components/brand/GradientButton";
 import { BeforeAfterSlider } from "@/components/app/BeforeAfterSlider";
 import { removeBackground } from "@/lib/snapcut.functions";
@@ -18,6 +19,7 @@ export function ImageUploader({ remaining }: { remaining: number }) {
   const [file, setFile] = useState<File | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [statusText, setStatusText] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<Result | null>(null);
   const [dragOver, setDragOver] = useState(false);
@@ -41,38 +43,82 @@ export function ImageUploader({ remaining }: { remaining: number }) {
     setPreviewUrl(null);
     setResult(null);
     setError(null);
+    setStatusText("");
     if (inputRef.current) inputRef.current.value = "";
+  }
+
+  async function processClientSide(targetFile: File, originalPreviewUrl: string) {
+    setStatusText("AI is cutting out background...");
+    try {
+      const outputBlob = await imglyRemoveBackground(targetFile, {
+        progress: (key: string, current: number, total: number) => {
+          if (total > 0) {
+            const pct = Math.round((current / total) * 100);
+            setStatusText(`AI processing... ${pct}%`);
+          } else {
+            setStatusText("AI is cutting out background...");
+          }
+        },
+      });
+
+      const processedUrl = URL.createObjectURL(outputBlob);
+      setResult({
+        before: originalPreviewUrl,
+        after: processedUrl,
+        fileName: targetFile.name,
+      });
+      toast.success("Background removed successfully!");
+      void queryClient.invalidateQueries();
+    } catch (clientErr) {
+      console.error("[SnapCut] Client-side background removal failed:", clientErr);
+      throw new Error("Could not remove background. Please try another image.");
+    }
   }
 
   async function process() {
     if (!file || busy) return;
     setBusy(true);
     setError(null);
-    try {
-      const dataBase64 = await fileToBase64(file);
-      const response = await run({
-        data: { fileName: file.name, mimeType: file.type, dataBase64 },
-      });
+    setStatusText("Preparing image...");
 
-      if (!response.success) {
-        setError(response.error.message);
-        toast.error(response.error.message);
-        return;
+    const originalPreview = previewUrl || URL.createObjectURL(file);
+
+    try {
+      // First attempt server-side processing if configured
+      let serverSucceeded = false;
+      try {
+        const dataBase64 = await fileToBase64(file);
+        setStatusText("AI is removing background...");
+        const response = await run({
+          data: { fileName: file.name, mimeType: file.type, dataBase64 },
+        });
+
+        if (response.success) {
+          serverSucceeded = true;
+          setResult({
+            before: response.data.originalImageUrl || originalPreview,
+            after: response.data.processedImageUrl,
+            fileName: file.name,
+          });
+          toast.success("Background removed successfully");
+          void queryClient.invalidateQueries();
+          return;
+        }
+      } catch (serverErr) {
+        console.warn("[SnapCut] Server processing failed, falling back to on-device AI:", serverErr);
       }
 
-      setResult({
-        before: response.data.originalImageUrl,
-        after: response.data.processedImageUrl,
-        fileName: file.name,
-      });
-      toast.success("Background removed successfully");
-      void queryClient.invalidateQueries();
-    } catch {
-      const message = "Unable to process the image. Please try again.";
+      // If server processing failed or wasn't configured, use the high-performance on-device AI model
+      if (!serverSucceeded) {
+        await processClientSide(file, originalPreview);
+      }
+    } catch (e) {
+      const message = e instanceof Error ? e.message : "Unable to process the image. Please try again.";
       setError(message);
       toast.error(message);
     } finally {
       setBusy(false);
+      setStatusText("");
     }
   }
 
@@ -96,7 +142,12 @@ export function ImageUploader({ remaining }: { remaining: number }) {
   return (
     <section className="glass-card p-5 sm:p-7">
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <h2 className="text-lg font-semibold">Remove a background</h2>
+        <div className="flex items-center gap-2">
+          <h2 className="text-lg font-semibold">Remove a background</h2>
+          <span className="inline-flex items-center gap-1 rounded-full bg-brand-cyan/10 px-2.5 py-0.5 text-xs font-medium text-brand-cyan">
+            <Sparkles className="size-3" /> AI Powered
+          </span>
+        </div>
         <span className="rounded-full border border-border px-3 py-1 text-xs text-muted-foreground">
           {remaining} of today&rsquo;s free removals left
         </span>
@@ -184,10 +235,11 @@ export function ImageUploader({ remaining }: { remaining: number }) {
             disabled={!file || busy || limitReached}
           >
             {busy ? <Loader2 className="animate-spin" /> : null}
-            {busy ? "Removing background…" : "Remove background"}
+            {busy ? (statusText || "Removing background…") : "Remove background"}
           </GradientButton>
         </>
       )}
     </section>
   );
 }
+
